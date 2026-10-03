@@ -253,6 +253,8 @@ See the [normative JSON schema](/model/gen-ai/gen-ai-input-messages.json) for mo
       // An image with opaque file ID e.g. the OpenAI files api
       {
         "type": "file",
+        "modality": "image",
+        "byte_size": 524288,
         "file_id": "provider_fileid_123"
       },
       // An image with unknown mime_type but known modality
