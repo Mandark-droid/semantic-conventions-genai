@@ -24,7 +24,7 @@ import argparse
 import json
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any, List, Literal, Optional, Union
+from typing import Annotated, Any, List, Literal, Optional, Union, get_args
 
 from pydantic import (
     BaseModel,
@@ -251,19 +251,19 @@ class UriPart(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class GenericPart(BaseModel):
-    """
-    Represents an arbitrary message part with any type and properties.
-    This allows for extensibility with custom message part types.
-    """
+def _not_known_types(known: Any) -> dict[str, Any]:
+    """Build a `{"not": {"enum": [...]}}` schema constraint from Literal `type` fields in `known`."""
+    models = get_args(known) or (known,)
+    return {
+        "not": {
+            "enum": [
+                get_args(m.model_fields["type"].annotation)[0] for m in models
+            ]
+        }
+    }
 
-    type: str = Field(description="The type of the content captured in this part.")
 
-    model_config = ConfigDict(extra="allow")
-
-
-# This Union without discriminator will generate anyOf in JSON schema
-MessagePart = Union[
+KnownMessagePart = Union[
     TextPart,
     ToolCallRequestPart,
     ToolCallResponsePart,
@@ -274,18 +274,63 @@ MessagePart = Union[
     UriPart,
     ReasoningPart,
     CompactionPart,
-    GenericPart,  # Catch-all for any other type
     # Add other message part types here as needed,
     # e.g. structured output, hosted tool call, etc.
+]
+
+
+class GenericPart(BaseModel):
+    """
+    Fallback for consumers when a message part has a `type` not defined by this
+    version of semantic conventions. When the instrumented API sends or returns
+    content that none of the defined part types fit, record the part keeping
+    the provider's fields. Consumers SHOULD expect parts with `type` values
+    they don't recognize, including provider-specific parts and part types
+    added in newer versions of semantic conventions.
+    """
+
+    type: str = Field(
+        description=(
+            "The type of the content captured in this part. "
+            "When recording a provider-specific part, it is RECOMMENDED to prefix "
+            "the value with `gen_ai.provider.name` (for example `anthropic.search_result`) "
+            "to avoid name collisions with current or future part types defined by semantic conventions."
+        ),
+        json_schema_extra=_not_known_types(KnownMessagePart),
+    )
+
+    model_config = ConfigDict(extra="allow")
+
+
+# This Union without discriminator will generate anyOf in JSON schema
+MessagePart = Union[
+    KnownMessagePart,
+    GenericPart,  # Catch-all for any other type
 ]
 
 # System instructions are modeled as their own list of parts, independent of
 # the input/output message parts. TextPart is the only member today;
 # add other system instruction part types once there is an existing
 # provider with non-text system instructions.
+class GenericSystemInstructionPart(GenericPart):
+    """
+    Fallback for consumers when a message part has a `type` not defined by this
+    version of semantic conventions. When the instrumented API sends or returns
+    content that none of the defined part types fit, record the part keeping
+    the provider's fields. Consumers SHOULD expect parts with `type` values
+    they don't recognize, including provider-specific parts and part types
+    added in newer versions of semantic conventions.
+    """
+
+    type: str = Field(
+        description=GenericPart.model_fields["type"].description,
+        json_schema_extra=_not_known_types(TextPart),
+    )
+
+
 SystemInstructionPart = Union[
     TextPart,
-    GenericPart,  # Catch-all for any other type
+    GenericSystemInstructionPart,  # Catch-all for any other type
     # Add other message part types here as needed
 ]
 
@@ -316,76 +361,45 @@ class ChatMessage(BaseModel):
 # --------------------------------------------------------------------------
 
 
+_SharedBlobPart = BlobPart
+
+
+def _swap_union_member(union: Any, old: Any, new: Any) -> Any:
+    """Return `union` with the member `old` replaced by `new`."""
+    return Union[tuple(new if member is old else member for member in get_args(union))]
+
+
 class _GenAiInputMessageModels:
     """
-    Namespace for the input-messages variants of the shared content-part
-    models. On the `gen_ai.input.messages` schema only, `BlobPart.content` is
-    optional and a `stripped_reason` marker records that the instrumentation
-    observed an inline blob but intentionally did not capture the payload
-    bytes. The variants deliberately reuse the shared class names so the
-    generated `$defs` keys (and the serialized wire format) stay identical
-    across the message schemas.
+    Namespace for the input-messages variants of the shared message models.
+    On the `gen_ai.input.messages` schema only, `BlobPart.content` is optional.
+    The variants deliberately reuse the shared class names so the generated
+    `$defs` keys (and the serialized wire format) stay identical across the
+    message schemas.
     """
 
-    class BlobPart(BlobPart):
+    class BlobPart(_SharedBlobPart):
         """Represents blob binary data sent inline to the model"""
 
         content: Optional[bytes] = Field(
             default=None,
             description=(
                 "Raw bytes of the attached data. This field SHOULD be encoded as a "
-                "base64 string when serialized to JSON. MAY be omitted when "
-                "`stripped_reason` is set."
-            ),
-        )
-        stripped_reason: Optional[str] = Field(
-            default=None,
-            description=(
-                "If set, indicates that the instrumentation observed an inline blob but "
-                "intentionally did not capture its payload bytes. The value is a short "
-                "free-form string describing why capture was skipped (examples: "
-                "`size_exceeded`, `modality_not_allowed`, `redactor_error`, "
-                "`upload_error`, `no_store_configured`). When `stripped_reason` is set "
-                "the `content` field MAY be omitted."
+                "base64 string when serialized to JSON. MAY be omitted when the "
+                "instrumentation does not capture the payload inline, for example "
+                "when it is stored externally or capture is limited by configuration."
             ),
         )
 
-        # JSON-schema-level constraint: serialized instances must carry either a
-        # non-null `content` or a non-null `stripped_reason` (or both). The
-        # Pydantic *runtime* model still allows both fields to be None; the
-        # constraint is exported via `json_schema_extra` and enforced by JSON
-        # schema validators on the consumer side.
-        model_config = ConfigDict(
-            json_schema_extra={
-                "anyOf": [
-                    {
-                        "properties": {"content": {"not": {"type": "null"}}},
-                        "required": ["content"],
-                    },
-                    {
-                        "properties": {"stripped_reason": {"not": {"type": "null"}}},
-                        "required": ["stripped_reason"],
-                    },
-                ]
-            }
-        )
-
-    MessagePart = Union[
-        TextPart,
-        ToolCallRequestPart,
-        ToolCallResponsePart,
-        ServerToolCallPart,
-        ServerToolCallResponsePart,
-        BlobPart,
-        FilePart,
-        UriPart,
-        ReasoningPart,
-        CompactionPart,
+    # The shared `KnownMessagePart` members with `BlobPart` swapped for the
+    # variant above, so part types added to the shared union are picked up here.
+    InputMessagePart = Union[
+        _swap_union_member(KnownMessagePart, _SharedBlobPart, BlobPart),
         GenericPart,  # Catch-all for any other type
     ]
 
     class ChatMessage(ChatMessage):
-        parts: List[MessagePart] = Field(
+        parts: List[InputMessagePart] = Field(
             description="List of message parts that make up the message content."
         )
 
@@ -479,23 +493,13 @@ class JsonSchemaDraft7:
 JsonSchemaDraft7Dict = Annotated[dict[str, Any], JsonSchemaDraft7]
 
 
-class GenericToolDefinition(BaseModel):
-    """
-    Represents a tool definition in any form.
-    """
-
-    type: str = Field(description="The type of the tool.")
-    name: str = Field(description="The name of the tool.")
-
-    model_config = ConfigDict(extra="allow")
-
-
-class FunctionToolDefinition(GenericToolDefinition):
+class FunctionToolDefinition(BaseModel):
     """
     Represents a tool definition in the form of a function.
     """
 
     type: Literal["function"] = Field(description="The type of the tool.")
+    name: str = Field(description="The name of the tool.")
     description: Optional[str] = Field(
         default=None,
         description=(
@@ -517,11 +521,37 @@ class FunctionToolDefinition(GenericToolDefinition):
     model_config = ConfigDict(extra="allow")
 
 
-ToolDefinition = Union[
+KnownToolDefinition = Union[
     FunctionToolDefinition,
-    GenericToolDefinition,  # Catch-all for any other type
     # Add other tool definition types here as needed,
     # e.g. file search, code interpreter, etc
+]
+
+
+class GenericToolDefinition(BaseModel):
+    """
+    Fallback for consumers when a tool definition has a `type` not defined by
+    this version of semantic conventions (such as a provider-specific built-in
+    tool or a tool type added in a newer version).
+    """
+
+    type: str = Field(
+        description=(
+            "The type of the tool. "
+            "When recording a provider-specific tool definition, it is RECOMMENDED to prefix "
+            "the value with `gen_ai.provider.name` (for example `anthropic.web_search_20250305`) "
+            "to avoid name collisions with current or future tool types defined by semantic conventions."
+        ),
+        json_schema_extra=_not_known_types(KnownToolDefinition),
+    )
+    name: str = Field(description="The name of the tool.")
+
+    model_config = ConfigDict(extra="allow")
+
+
+ToolDefinition = Union[
+    KnownToolDefinition,
+    GenericToolDefinition,  # Catch-all for any other type
 ]
 
 
